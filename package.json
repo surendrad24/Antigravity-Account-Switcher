@@ -1,0 +1,74 @@
+{
+  "name": "antigravity-account-switcher",
+  "displayName": "Antigravity Account Switcher",
+  "description": "Switch between multiple accounts in Antigravity to bypass model rate limits. Works on Windows, Linux, and macOS.",
+  "version": "1.0.0",
+  "publisher": "fusionlancers",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/surendrad24/antigravity-account-switcher"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "antigravity-switcher.saveProfile",
+        "title": "Antigravity: Save Current Profile"
+      },
+      {
+        "command": "antigravity-switcher.switchProfile",
+        "title": "Antigravity: Switch Profile"
+      },
+      {
+        "command": "antigravity-switcher.deleteProfile",
+        "title": "Antigravity: Delete Profile"
+      },
+      {
+        "command": "antigravity-switcher.listProfiles",
+        "title": "Antigravity: List Profiles"
+      },
+      {
+        "command": "antigravity-switcher.setActiveProfile",
+        "title": "Antigravity: Set Active Profile (No Restart)"
+      }
+    ],
+    "configuration": {
+      "title": "Antigravity Account Switcher",
+      "properties": {
+        "antigravitySwitcher.maxProfiles": {
+          "type": "number",
+          "default": 7,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Maximum number of profiles allowed (reflected in status bar slots)"
+        },
+        "antigravitySwitcher.profilesDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Custom directory to store profiles (leave empty for platform default)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "test": "node ./test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0"
+  }
+}
