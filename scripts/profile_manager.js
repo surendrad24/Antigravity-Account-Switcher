@@ -13,7 +13,7 @@
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
-const { execFileSync, spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 
 // ─── CLI argument parsing ────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -26,9 +26,10 @@ function getArg(flag) {
 const action      = getArg('--action');
 const profileName = getArg('--profile') || '';
 const maxProfiles = parseInt(getArg('--max') || '7', 10);
+const profilesDirArg = getArg('--profiles-dir');
 
-if (!action || !['Save', 'Load', 'List', 'Delete'].includes(action)) {
-    console.error('Invalid or missing --action. Must be one of: Save, Load, List, Delete');
+if (!action || !['Save', 'Load', 'List', 'Delete', 'Reset'].includes(action)) {
+    console.error('Invalid or missing --action. Must be one of: Save, Load, List, Delete, Reset');
     process.exit(1);
 }
 
@@ -76,6 +77,7 @@ function getAntigravityExecutablePaths() {
             return [
                 '/usr/bin/antigravity',
                 '/usr/local/bin/antigravity',
+                '/usr/share/antigravity/antigravity',
                 path.join(home, '.local', 'bin', 'antigravity'),
                 path.join(home, 'bin', 'antigravity'),
                 '/opt/antigravity/antigravity',
@@ -96,8 +98,11 @@ function getAntigravityProcessName() {
 }
 
 const antigravityDataPath = getAntigravityDataPath();
-const profilesStorePath   = path.join(antigravityDataPath, 'Profiles');
-const userDataPath        = path.join(antigravityDataPath, 'User');
+const antigravityExtPath  = path.join(os.homedir(), '.antigravity');
+const antigravityGemPath  = path.join(os.homedir(), '.gemini', 'antigravity-browser-profile');
+const profilesStorePath   = profilesDirArg
+    ? path.resolve(profilesDirArg)
+    : path.join(antigravityDataPath, 'Profiles');
 
 // Ensure profiles directory exists
 fs.mkdirSync(profilesStorePath, { recursive: true });
@@ -134,9 +139,12 @@ function copyDirRecursive(src, dest) {
 
 function removeDirRecursive(dirPath) {
     if (!fs.existsSync(dirPath)) return;
+
     // Node 12+ has fs.rmSync; fall back for older runtimes
     if (fs.rmSync) {
-        fs.rmSync(dirPath, { recursive: true, force: true });
+        try {
+            fs.rmSync(dirPath, { recursive: true, force: true });
+        } catch (e) {}
     } else {
         // Polyfill for older Node
         for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
@@ -148,6 +156,38 @@ function removeDirRecursive(dirPath) {
     }
 }
 
+function removePathForce(targetPath) {
+    if (!fs.existsSync(targetPath)) return;
+    const stat = fs.lstatSync(targetPath);
+    if (stat.isDirectory()) {
+        removeDirRecursive(targetPath);
+    } else {
+        fs.unlinkSync(targetPath);
+    }
+}
+
+function removePathWithRetry(targetPath, retries = 8, delayMs = 500) {
+    if (!fs.existsSync(targetPath)) return true;
+    for (let i = 0; i < retries; i++) {
+        try {
+            removePathForce(targetPath);
+            if (!fs.existsSync(targetPath)) return true;
+        } catch (_) {}
+        sleep(delayMs);
+    }
+    return !fs.existsSync(targetPath);
+}
+
+function resolveOnPath(binName) {
+    const pathVar = process.env.PATH || '';
+    const dirs = pathVar.split(path.delimiter).filter(Boolean);
+    for (const dir of dirs) {
+        const candidate = path.join(dir, binName);
+        if (fs.existsSync(candidate)) return candidate;
+    }
+    return null;
+}
+
 /** Kill all running Antigravity processes in a cross-platform way. */
 function killAntigravityProcesses() {
     const procName = getAntigravityProcessName();
@@ -155,10 +195,25 @@ function killAntigravityProcesses() {
         if (process.platform === 'win32') {
             spawnSync('taskkill', ['/F', '/IM', `${procName}.exe`], { stdio: 'ignore' });
         } else {
-            // pkill -x does an exact-name match; ignore errors if no process found
-            spawnSync('pkill', ['-x', procName], { stdio: 'ignore' });
-            // Also try lowercase variant
-            spawnSync('pkill', ['-xi', procName], { stdio: 'ignore' });
+            console.log('[DEBUG] Attempting to kill all Antigravity processes...');
+            // Find matching processes and kill only real Antigravity app PIDs.
+            const pgrep = spawnSync('pgrep', ['-a', '-i', '-f', 'antigravity'], { encoding: 'utf8' });
+            if (pgrep.stdout) {
+                const selfPid = process.pid;
+                const parentPid = process.ppid;
+                const lines = pgrep.stdout.split('\n').filter(Boolean);
+                for (const line of lines) {
+                    const firstSpace = line.indexOf(' ');
+                    if (firstSpace <= 0) continue;
+                    const pid = Number(line.slice(0, firstSpace));
+                    const cmd = line.slice(firstSpace + 1).toLowerCase();
+                    if (!Number.isFinite(pid)) continue;
+                    if (pid === selfPid || pid === parentPid) continue;
+                    if (cmd.includes('profile_manager.js') || cmd.includes('node')) continue;
+                    console.log(`[DEBUG] Killing app PID: ${pid}`);
+                    spawnSync('kill', ['-9', String(pid)], { stdio: 'ignore' });
+                }
+            }
         }
     } catch (_) {}
 }
@@ -172,33 +227,65 @@ function sleep(ms) {
 
 /** Find and return the Antigravity executable path, or null. */
 function findAntigravityExe() {
+    console.log('[DEBUG] Searching for Antigravity executable...');
+    // 1. Try PATH resolution without shell utilities.
+    const fromPath = process.platform === 'win32'
+        ? (resolveOnPath('Antigravity.exe') || resolveOnPath('antigravity.exe') || resolveOnPath('antigravity.cmd'))
+        : resolveOnPath('antigravity');
+    if (fromPath) {
+        console.log(`[DEBUG] Found via PATH: ${fromPath}`);
+        return fromPath;
+    }
+
+    // 2. Try standard locations.
     for (const p of getAntigravityExecutablePaths()) {
-        if (fs.existsSync(p)) return p;
+        console.log(`[DEBUG] Checking path: ${p}`);
+        if (fs.existsSync(p)) {
+            console.log(`[DEBUG] Found in standard location: ${p}`);
+            return p;
+        }
     }
     return null;
 }
 
 /** Launch Antigravity in a fully detached, non-blocking manner. */
 function launchAntigravity(exePath) {
-    const { spawn } = require('child_process');
+    const attempts = [];
+
+    // Preferred explicit executable path first (if found)
+    if (exePath) attempts.push({ kind: 'path', value: exePath });
+
+    // Fallbacks from PATH/common wrappers
+    attempts.push({ kind: 'bin', value: 'antigravity' });
+    attempts.push({ kind: 'bin', value: 'antigravity.cmd' });
+
     if (process.platform === 'win32') {
-        // On Windows, use explorer.exe to detach cleanly (avoids console inheritance)
-        spawn('explorer.exe', [`"${exePath}"`], {
-            detached: true,
-            shell: true,
-            stdio: 'ignore'
-        }).unref();
+        for (const attempt of attempts) {
+            try {
+                spawn(attempt.value, [], { detached: true, shell: false, stdio: 'ignore' }).unref();
+                return true;
+            } catch (_) {}
+        }
+        return false;
     } else {
-        spawn(exePath, [], {
-            detached: true,
-            stdio: 'ignore',
-            env: process.env
-        }).unref();
+        // Detached spawn is enough here; no shell/nohup dependency.
+        for (const attempt of attempts) {
+            try {
+                console.log(`[DEBUG] Launch attempt: ${attempt.value}`);
+                spawn(attempt.value, [], {
+                    detached: true,
+                    stdio: 'ignore',
+                    env: process.env,
+                    shell: false
+                }).unref();
+                return true;
+            } catch (_) {}
+        }
+        return false;
     }
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
-
 function getProfiles() {
     const profiles = [];
     if (!fs.existsSync(profilesStorePath)) return profiles;
@@ -214,9 +301,8 @@ function getProfiles() {
     }
     return profiles;
 }
-
 function saveProfile(name) {
-    // Validate name (no path separators or shell-dangerous chars)
+    // Validate name
     if (/[\\/:*?"<>|\0]/.test(name)) {
         console.error('Profile name contains invalid characters');
         process.exit(1);
@@ -226,12 +312,7 @@ function saveProfile(name) {
     const exists   = existing.some(p => p.Name === name);
 
     if (!exists && existing.length >= maxProfiles) {
-        console.error(`Maximum profile limit (${maxProfiles}) reached. Delete a profile first.`);
-        process.exit(1);
-    }
-
-    if (!fs.existsSync(userDataPath)) {
-        console.error(`User Data directory not found at: ${userDataPath}`);
+        console.error(`Maximum profile limit (${maxProfiles}) reached.`);
         process.exit(1);
     }
 
@@ -241,8 +322,42 @@ function saveProfile(name) {
         removeDirRecursive(targetPath);
     }
 
-    console.log(`Saving profile '${name}'...`);
-    copyDirRecursive(userDataPath, targetPath);
+    console.log(`Saving all data to profile '${name}'...`);
+    fs.mkdirSync(targetPath, { recursive: true });
+
+    // 1. Copy from .config/Antigravity
+    for (const entry of fs.readdirSync(antigravityDataPath, { withFileTypes: true })) {
+        if (entry.name === 'Profiles' || entry.name.includes('_switching_backup') || entry.name === 'active_profile.txt') continue;
+        const srcPath  = path.join(antigravityDataPath, entry.name);
+        const destPath = path.join(targetPath, 'config_' + entry.name); // Prefix to avoid collisions
+        try {
+            if (entry.isDirectory()) copyDirRecursive(srcPath, destPath);
+            else fs.copyFileSync(srcPath, destPath);
+        } catch (e) {}
+    }
+
+    // 2. Copy from .antigravity (except the switcher extension itself)
+    const targetExtPath = path.join(targetPath, 'ext_data');
+    fs.mkdirSync(targetExtPath, { recursive: true });
+    if (fs.existsSync(antigravityExtPath)) {
+        for (const entry of fs.readdirSync(antigravityExtPath, { withFileTypes: true })) {
+            if (entry.name === 'extensions') continue; // Don't swap the extensions themselves
+            const srcPath  = path.join(antigravityExtPath, entry.name);
+            const destPath = path.join(targetExtPath, entry.name);
+            try {
+                if (entry.isDirectory()) copyDirRecursive(srcPath, destPath);
+                else fs.copyFileSync(srcPath, destPath);
+            } catch (e) {}
+        }
+    }
+
+    // 3. Copy from .gemini profile
+    const targetGemPath = path.join(targetPath, 'gem_data');
+    if (fs.existsSync(antigravityGemPath)) {
+        fs.mkdirSync(targetGemPath, { recursive: true });
+        copyDirRecursive(antigravityGemPath, targetGemPath);
+    }
+
     console.log(`Profile '${name}' saved successfully.`);
     console.log(JSON.stringify({ Success: true, Message: 'Profile saved' }));
 }
@@ -256,55 +371,111 @@ function loadProfile(name) {
     }
 
     const exePath = findAntigravityExe();
-    if (!exePath) {
-        console.error('Could not find Antigravity executable');
-        process.exit(1);
-    }
 
     // Stop Antigravity
     console.log('Stopping Antigravity...');
     killAntigravityProcesses();
-    sleep(3000);
+    sleep(5000); // Wait longer for Linux processes to release file locks
 
-    // Backup current User Data
-    const backupPath = `${userDataPath}_switching_backup`;
-    if (fs.existsSync(backupPath)) {
-        removeDirRecursive(backupPath);
+    // Swap the entire directory
+    console.log(`Switching to profile '${name}'...`);
+
+    // 1. Clear current root data
+    console.log(`[DEBUG] Clearing active data in ${antigravityDataPath} and ${antigravityExtPath}...`);
+    
+    // Clear .config/Antigravity
+    const clearFailures = [];
+    for (const entry of fs.readdirSync(antigravityDataPath, { withFileTypes: true })) {
+        if (entry.name === 'Profiles' || entry.name === 'active_profile.txt') continue;
+        const fullPath = path.join(antigravityDataPath, entry.name);
+        if (!removePathWithRetry(fullPath)) clearFailures.push(fullPath);
     }
 
-    if (fs.existsSync(userDataPath)) {
-        console.log('Backing up current session...');
-        fs.renameSync(userDataPath, backupPath);
-    }
-
-    // Copy profile to User Data
-    console.log(`Loading profile '${name}'...`);
-    copyDirRecursive(profilePath, userDataPath);
-
-    // Clean up backup asynchronously
-    if (fs.existsSync(backupPath)) {
-        // Best-effort background cleanup
-        try {
-            const { fork } = require('child_process');
-            // Re-invoke this same script as a cleanup worker
-            const child = fork(
-                __filename,
-                ['--action', '_cleanup', '--profile', backupPath],
-                { detached: true, stdio: 'ignore' }
-            );
-            child.unref();
-        } catch (_) {
-            // Non-critical – cleanup on next switch
+    // Clear .antigravity (except extensions)
+    if (fs.existsSync(antigravityExtPath)) {
+        for (const entry of fs.readdirSync(antigravityExtPath, { withFileTypes: true })) {
+            if (entry.name === 'extensions') continue;
+            const fullPath = path.join(antigravityExtPath, entry.name);
+            if (!removePathWithRetry(fullPath)) clearFailures.push(fullPath);
         }
     }
 
+    // Clear .gemini profile
+    if (fs.existsSync(antigravityGemPath)) {
+        if (!removePathWithRetry(antigravityGemPath)) clearFailures.push(antigravityGemPath);
+    }
+
+    if (clearFailures.length > 0) {
+        console.error(`Failed to fully clear existing profile data:\n${clearFailures.join('\n')}`);
+        process.exit(1);
+    }
+
+    // 2. Copy profile content to root
+    console.log(`[DEBUG] Copying profile content from ${profilePath}...`);
+    for (const entry of fs.readdirSync(profilePath, { withFileTypes: true })) {
+        if (entry.name === 'ext_data') {
+            // Restore .antigravity folder
+            const extDataPath = path.join(profilePath, 'ext_data');
+            for (const subEntry of fs.readdirSync(extDataPath, { withFileTypes: true })) {
+                const srcPath  = path.join(extDataPath, subEntry.name);
+                const destPath = path.join(antigravityExtPath, subEntry.name);
+                try {
+                    if (subEntry.isDirectory()) copyDirRecursive(srcPath, destPath);
+                    else fs.copyFileSync(srcPath, destPath);
+                } catch (e) {
+                    console.error(`Failed to restore extension data: ${srcPath} -> ${destPath}`);
+                    console.error(e.message);
+                    process.exit(1);
+                }
+            }
+        } else if (entry.name === 'gem_data') {
+            // Restore .gemini folder
+            fs.mkdirSync(antigravityGemPath, { recursive: true });
+            copyDirRecursive(path.join(profilePath, 'gem_data'), antigravityGemPath);
+        } else if (entry.name.startsWith('config_')) {
+            // Restore .config/Antigravity folder
+            const realName = entry.name.slice('config_'.length);
+            const srcPath  = path.join(profilePath, entry.name);
+            const destPath = path.join(antigravityDataPath, realName);
+            try {
+                if (entry.isDirectory()) copyDirRecursive(srcPath, destPath);
+                else fs.copyFileSync(srcPath, destPath);
+            } catch (e) {
+                console.error(`Failed to restore config data: ${srcPath} -> ${destPath}`);
+                console.error(e.message);
+                process.exit(1);
+            }
+        }
+    }
+
+    // 3. Mark as active
+    try {
+        fs.writeFileSync(path.join(antigravityDataPath, 'active_profile.txt'), name);
+    } catch (e) {}
+
     // Restart Antigravity
-    console.log('Starting Antigravity...');
+    console.log(`Starting Antigravity${exePath ? ` from: ${exePath}` : ' from PATH fallback'}...`);
     sleep(2000);
-    launchAntigravity(exePath);
+    const launchOk = launchAntigravity(exePath);
+    if (!launchOk) {
+        console.error('Failed to relaunch Antigravity automatically. Please open it manually.');
+        process.exit(1);
+    }
 
     console.log(`Profile '${name}' loaded successfully.`);
     console.log(JSON.stringify({ Success: true, Message: 'Profile loaded', Restarted: true }));
+}
+
+function resetProfile(name) {
+    const targetPath = path.join(profilesStorePath, name);
+    if (fs.existsSync(targetPath)) {
+        removeDirRecursive(targetPath);
+    }
+    fs.mkdirSync(targetPath, { recursive: true });
+    // Create a dummy file to ensure the folder is kept
+    fs.writeFileSync(path.join(targetPath, '.empty_profile'), '');
+    console.log(`Fresh empty profile '${name}' created.`);
+    console.log(JSON.stringify({ Success: true, Message: 'Profile reset' }));
 }
 
 function deleteProfile(name) {
@@ -323,18 +494,13 @@ function deleteProfile(name) {
 function listProfiles() {
     const profiles = getProfiles();
     const count    = profiles.length;
-
-    if (count === 0) {
-        console.log('No profiles saved yet.');
-        console.log(JSON.stringify({ Profiles: [], Count: 0, MaxProfiles: maxProfiles }));
-    } else {
-        console.log(`Saved Profiles (${count}/${maxProfiles}):`);
-        console.log('-----------------------------------');
-        for (const p of profiles) {
-            console.log(`  - ${p.Name} (Created: ${p.Created}, Size: ${p.Size} MB)`);
-        }
-        console.log(JSON.stringify({ Profiles: profiles, Count: count, MaxProfiles: maxProfiles }));
-    }
+    // Extension relies on this JSON output.
+    console.log(JSON.stringify({ 
+        Profiles: profiles, 
+        Count: count, 
+        MaxProfiles: maxProfiles,
+        DataPath: antigravityDataPath 
+    }));
 }
 
 // ─── Dispatch ─────────────────────────────────────────────────────────────────
@@ -353,6 +519,10 @@ switch (action) {
     case 'Delete':
         if (!profileName) { console.error('--profile is required for Delete'); process.exit(1); }
         deleteProfile(profileName);
+        break;
+    case 'Reset':
+        if (!profileName) { console.error('--profile is required for Reset'); process.exit(1); }
+        resetProfile(profileName);
         break;
     case '_cleanup':
         // Internal: called as a detached child to remove old backup

@@ -2,7 +2,7 @@
   "name": "antigravity-account-switcher",
   "displayName": "Antigravity Account Switcher",
   "description": "Switch between multiple accounts in Antigravity to bypass model rate limits. Works on Windows, Linux, and macOS.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "fusionlancers",
   "license": "MIT",
   "repository": {
@@ -44,6 +44,42 @@
       {
         "command": "antigravity-switcher.setActiveProfile",
         "title": "Antigravity: Set Active Profile (No Restart)"
+      },
+      {
+        "command": "antigravity-switcher.showActivityLog",
+        "title": "Antigravity: Show Switcher Activity Log"
+      },
+      {
+        "command": "antigravity-switcher.runDiagnostics",
+        "title": "Antigravity: Run Switcher Diagnostics"
+      },
+      {
+        "command": "antigravity-switcher.healthCheckProfiles",
+        "title": "Antigravity: Health Check Profiles"
+      },
+      {
+        "command": "antigravity-switcher.exportProfile",
+        "title": "Antigravity: Export Profile Folder"
+      },
+      {
+        "command": "antigravity-switcher.importProfile",
+        "title": "Antigravity: Import Profile Folder"
+      },
+      {
+        "command": "antigravity-switcher.repairCurrentSession",
+        "title": "Antigravity: Repair Current Session Cache"
+      },
+      {
+        "command": "antigravity-switcher.exportProfileEncrypted",
+        "title": "Antigravity: Export Profile Encrypted"
+      },
+      {
+        "command": "antigravity-switcher.importProfileEncrypted",
+        "title": "Antigravity: Import Profile Encrypted"
+      },
+      {
+        "command": "antigravity-switcher.showAnalytics",
+        "title": "Antigravity: Show Profile Analytics"
       }
     ],
     "configuration": {
@@ -60,6 +96,18 @@
           "type": "string",
           "default": "",
           "description": "Custom directory to store profiles (leave empty for platform default)"
+        },
+        "antigravitySwitcher.profilePin": {
+          "type": "string",
+          "default": "",
+          "description": "Optional PIN required before switching/deleting profiles"
+        },
+        "antigravitySwitcher.autoSnapshotMinutes": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 1440,
+          "description": "Auto-save snapshot interval in minutes (0 disables)"
         }
       }
     }
