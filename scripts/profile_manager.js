@@ -33,6 +33,7 @@ if (!action || !['Save', 'Load', 'List', 'Delete', 'Reset'].includes(action)) {
     process.exit(1);
 }
 
+
 // ─── Platform-aware paths ────────────────────────────────────────────────────
 
 /**
@@ -54,6 +55,41 @@ function getAntigravityDataPath() {
 }
 
 /**
+ * Returns the OS-appropriate path to the .antigravity extension data directory.
+ *
+ * Windows : %APPDATA%\.antigravity  (APPDATA, not LOCALAPPDATA)
+ * macOS   : ~/Library/Application Support/.antigravity  (checked) OR ~/.antigravity
+ * Linux   : ~/.antigravity
+ */
+function getAntigravityExtPath() {
+    const home = os.homedir();
+    if (process.platform === 'win32') {
+        // On Windows, hidden-dot dirs go under APPDATA\\.antigravity conventionally
+        return path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), '.antigravity');
+    }
+    if (process.platform === 'darwin') {
+        // macOS Antigravity may put extension state in both locations; prefer ~/.antigravity
+        // if it exists, else fall back to the Library path.
+        const dotPath = path.join(home, '.antigravity');
+        if (fs.existsSync(dotPath)) return dotPath;
+        return path.join(home, 'Library', 'Application Support', '.antigravity');
+    }
+    return path.join(home, '.antigravity');
+}
+
+/**
+ * Returns the root path where Antigravity stores Google OAuth credentials.
+ *
+ * All platforms use ~/.gemini/ (a hidden dir off the user home).
+ * On Windows: C:\Users\<user>\.gemini\
+ * On macOS:   /Users/<user>/.gemini/
+ * On Linux:   /home/<user>/.gemini/
+ */
+function getGeminiRootPath() {
+    return path.join(os.homedir(), '.gemini');
+}
+
+/**
  * Returns common paths where Antigravity might install its executable,
  * ordered by likelihood on each platform.
  */
@@ -71,6 +107,7 @@ function getAntigravityExecutablePaths() {
                 '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
                 path.join(home, 'Applications', 'Antigravity.app', 'Contents', 'MacOS', 'Antigravity'),
                 '/usr/local/bin/antigravity',
+                '/opt/homebrew/bin/antigravity',
                 path.join(home, '.local', 'bin', 'antigravity'),
             ];
         default: // linux
@@ -98,9 +135,35 @@ function getAntigravityProcessName() {
 }
 
 const antigravityDataPath = getAntigravityDataPath();
-const antigravityExtPath  = path.join(os.homedir(), '.antigravity');
-const antigravityGemPath  = path.join(os.homedir(), '.gemini', 'antigravity-browser-profile');
-const profilesStorePath   = profilesDirArg
+const antigravityExtPath  = getAntigravityExtPath();
+
+// The real Antigravity auth data lives in ~/.gemini/ directly (all platforms):
+//   oauth_creds.json, google_accounts.json, installation_id,
+//   state.json, settings.json, projects.json, trustedFolders.json
+// NOTE: We do NOT back up ~/.gemini/antigravity/ (AI assistant app data)
+//       and we handle ~/.gemini/history/ separately as 'gem_history'.
+const geminiRootPath    = getGeminiRootPath();
+const geminiHistoryPath = path.join(geminiRootPath, 'history');
+
+// Auth-relevant files inside ~/.gemini/ root that belong to a specific Google account.
+const GEMINI_AUTH_FILES = [
+    'oauth_creds.json',
+    'google_accounts.json',
+    'installation_id',
+    'state.json',
+    'settings.json',
+    'projects.json',
+    'trustedFolders.json',
+];
+
+// Subdirectories of ~/.gemini/ to skip (AI assistant app data, not per-account auth).
+// Comparison is case-insensitive to handle Windows filesystem behaviour.
+const GEMINI_EXCLUDED_DIRS = ['antigravity'];
+function isExcludedGeminiDir(name) {
+    return GEMINI_EXCLUDED_DIRS.some(d => d.toLowerCase() === name.toLowerCase());
+}
+
+const profilesStorePath = profilesDirArg
     ? path.resolve(profilesDirArg)
     : path.join(antigravityDataPath, 'Profiles');
 
@@ -188,18 +251,45 @@ function resolveOnPath(binName) {
     return null;
 }
 
+/**
+ * Sleep for N milliseconds.
+ *
+ * Uses Atomics.wait (synchronous, zero-overhead) on worker threads (Linux/macOS
+ * in Node ≥ 9). Falls back to a busy-wait on the main thread (Windows) where
+ * Atomics.wait is prohibited by spec.
+ */
+function sleep(ms) {
+    try {
+        const sab  = new SharedArrayBuffer(4);
+        const view = new Int32Array(sab);
+        // Atomics.wait throws "Cannot be performed on the main thread" on Windows
+        // and returns "timed-out" on success on Linux/macOS.
+        const result = Atomics.wait(view, 0, 0, ms);
+        if (result === 'not-equal' || result === 'timed-out') return; // worked
+    } catch (_) {
+        // Fallback: busy-wait (only reached on Windows main thread)
+        const end = Date.now() + ms;
+        while (Date.now() < end) { /* spin */ }
+    }
+}
+
 /** Kill all running Antigravity processes in a cross-platform way. */
 function killAntigravityProcesses() {
     const procName = getAntigravityProcessName();
     try {
         if (process.platform === 'win32') {
             spawnSync('taskkill', ['/F', '/IM', `${procName}.exe`], { stdio: 'ignore' });
+        } else if (process.platform === 'darwin') {
+            // macOS: pkill is available and more reliable than pgrep + kill loop.
+            // -i = case-insensitive, -f = match full command line
+            spawnSync('pkill', ['-9', '-if', 'antigravity'], { stdio: 'ignore' });
         } else {
+            // Linux: pgrep -a lists PID + full cmdline; filter carefully to avoid
+            // killing ourselves or the Node process running this script.
             console.log('[DEBUG] Attempting to kill all Antigravity processes...');
-            // Find matching processes and kill only real Antigravity app PIDs.
             const pgrep = spawnSync('pgrep', ['-a', '-i', '-f', 'antigravity'], { encoding: 'utf8' });
             if (pgrep.stdout) {
-                const selfPid = process.pid;
+                const selfPid   = process.pid;
                 const parentPid = process.ppid;
                 const lines = pgrep.stdout.split('\n').filter(Boolean);
                 for (const line of lines) {
@@ -218,20 +308,18 @@ function killAntigravityProcesses() {
     } catch (_) {}
 }
 
-/** Sleep for N milliseconds (synchronous via Atomics). */
-function sleep(ms) {
-    const sab = new SharedArrayBuffer(4);
-    const view = new Int32Array(sab);
-    Atomics.wait(view, 0, 0, ms);
-}
-
 /** Find and return the Antigravity executable path, or null. */
 function findAntigravityExe() {
     console.log('[DEBUG] Searching for Antigravity executable...');
     // 1. Try PATH resolution without shell utilities.
-    const fromPath = process.platform === 'win32'
-        ? (resolveOnPath('Antigravity.exe') || resolveOnPath('antigravity.exe') || resolveOnPath('antigravity.cmd'))
-        : resolveOnPath('antigravity');
+    let fromPath;
+    if (process.platform === 'win32') {
+        fromPath = resolveOnPath('Antigravity.exe')
+            || resolveOnPath('antigravity.exe')
+            || resolveOnPath('antigravity.cmd');
+    } else {
+        fromPath = resolveOnPath('antigravity');
+    }
     if (fromPath) {
         console.log(`[DEBUG] Found via PATH: ${fromPath}`);
         return fromPath;
@@ -250,33 +338,37 @@ function findAntigravityExe() {
 
 /** Launch Antigravity in a fully detached, non-blocking manner. */
 function launchAntigravity(exePath) {
-    const attempts = [];
-
-    // Preferred explicit executable path first (if found)
-    if (exePath) attempts.push({ kind: 'path', value: exePath });
-
-    // Fallbacks from PATH/common wrappers
-    attempts.push({ kind: 'bin', value: 'antigravity' });
-    attempts.push({ kind: 'bin', value: 'antigravity.cmd' });
-
     if (process.platform === 'win32') {
-        for (const attempt of attempts) {
+        // On Windows .cmd wrappers must be launched with shell:true.
+        // Try the resolved .exe first (shell not needed), then .cmd fallbacks.
+        const attempts = exePath ? [exePath] : [];
+        attempts.push('antigravity.cmd', 'antigravity');
+
+        for (const bin of attempts) {
+            const needsShell = bin.endsWith('.cmd') || bin.endsWith('.bat');
             try {
-                spawn(attempt.value, [], { detached: true, shell: false, stdio: 'ignore' }).unref();
+                spawn(bin, [], {
+                    detached: true,
+                    shell: needsShell,
+                    stdio: 'ignore',
+                }).unref();
                 return true;
             } catch (_) {}
         }
         return false;
     } else {
-        // Detached spawn is enough here; no shell/nohup dependency.
-        for (const attempt of attempts) {
+        // macOS / Linux: detached spawn, no shell dependency.
+        const attempts = exePath ? [exePath] : [];
+        attempts.push('antigravity');
+
+        for (const bin of attempts) {
             try {
-                console.log(`[DEBUG] Launch attempt: ${attempt.value}`);
-                spawn(attempt.value, [], {
+                console.log(`[DEBUG] Launch attempt: ${bin}`);
+                spawn(bin, [], {
                     detached: true,
-                    stdio: 'ignore',
-                    env: process.env,
-                    shell: false
+                    stdio:    'ignore',
+                    env:      process.env,
+                    shell:    false,
                 }).unref();
                 return true;
             } catch (_) {}
@@ -284,6 +376,7 @@ function launchAntigravity(exePath) {
         return false;
     }
 }
+
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
 function getProfiles() {
@@ -351,11 +444,40 @@ function saveProfile(name) {
         }
     }
 
-    // 3. Copy from .gemini profile
-    const targetGemPath = path.join(targetPath, 'gem_data');
-    if (fs.existsSync(antigravityGemPath)) {
-        fs.mkdirSync(targetGemPath, { recursive: true });
-        copyDirRecursive(antigravityGemPath, targetGemPath);
+    // 3. Save auth-relevant files from ~/.gemini/ root (oauth_creds, google_accounts, etc.)
+    //    These are the Google OAuth tokens — the root cause of having to re-login.
+    const targetGemAuthPath = path.join(targetPath, 'gem_auth');
+    fs.mkdirSync(targetGemAuthPath, { recursive: true });
+    if (fs.existsSync(geminiRootPath)) {
+        for (const entry of fs.readdirSync(geminiRootPath, { withFileTypes: true })) {
+            // Only copy auth-relevant named files; skip excluded dirs and the history dir
+            if (isExcludedGeminiDir(entry.name)) continue;
+            if (entry.name === 'history') continue; // saved separately below
+            if (entry.isDirectory()) {
+                // Save non-excluded subdirectories (e.g. any future auth dirs)
+                const srcPath  = path.join(geminiRootPath, entry.name);
+                const destPath = path.join(targetGemAuthPath, entry.name);
+                try { copyDirRecursive(srcPath, destPath); } catch (e) {}
+            } else if (GEMINI_AUTH_FILES.includes(entry.name)) {
+                // Copy auth files by whitelist
+                const srcPath  = path.join(geminiRootPath, entry.name);
+                const destPath = path.join(targetGemAuthPath, entry.name);
+                try { fs.copyFileSync(srcPath, destPath); } catch (e) {}
+            }
+        }
+    }
+
+    // 4. Save chat history from ~/.gemini/history/
+    //    This is the root cause of chat history being lost on profile switch.
+    const targetGemHistoryPath = path.join(targetPath, 'gem_history');
+    if (fs.existsSync(geminiHistoryPath)) {
+        fs.mkdirSync(targetGemHistoryPath, { recursive: true });
+        try {
+            copyDirRecursive(geminiHistoryPath, targetGemHistoryPath);
+            console.log(`Chat history saved to profile '${name}'.`);
+        } catch (e) {
+            console.error(`Warning: could not save chat history: ${e.message}`);
+        }
     }
 
     console.log(`Profile '${name}' saved successfully.`);
@@ -375,7 +497,12 @@ function loadProfile(name) {
     // Stop Antigravity
     console.log('Stopping Antigravity...');
     killAntigravityProcesses();
-    sleep(5000); // Wait longer for Linux processes to release file locks
+    // Wait for process to fully release file locks before clearing data.
+    // Windows releases handles quickly; Linux Electron takes longer.
+    const killWaitMs = process.platform === 'win32' ? 2000
+                     : process.platform === 'darwin' ? 3000
+                     : 5000; // linux
+    sleep(killWaitMs);
 
     // Swap the entire directory
     console.log(`Switching to profile '${name}'...`);
@@ -400,9 +527,26 @@ function loadProfile(name) {
         }
     }
 
-    // Clear .gemini profile
-    if (fs.existsSync(antigravityGemPath)) {
-        if (!removePathWithRetry(antigravityGemPath)) clearFailures.push(antigravityGemPath);
+    // Clear auth-relevant files in ~/.gemini/ root (excluding app dirs and history)
+    if (fs.existsSync(geminiRootPath)) {
+        for (const entry of fs.readdirSync(geminiRootPath, { withFileTypes: true })) {
+            if (isExcludedGeminiDir(entry.name)) continue;
+            if (entry.name === 'history') continue; // cleared separately below
+            if (entry.isDirectory()) {
+                // Clear non-excluded subdirs
+                const fullPath = path.join(geminiRootPath, entry.name);
+                if (!removePathWithRetry(fullPath)) clearFailures.push(fullPath);
+            } else if (GEMINI_AUTH_FILES.includes(entry.name)) {
+                // Remove auth files
+                const fullPath = path.join(geminiRootPath, entry.name);
+                try { fs.unlinkSync(fullPath); } catch (_) {}
+            }
+        }
+    }
+
+    // Clear chat history in ~/.gemini/history/ before restoring from profile
+    if (fs.existsSync(geminiHistoryPath)) {
+        if (!removePathWithRetry(geminiHistoryPath)) clearFailures.push(geminiHistoryPath);
     }
 
     if (clearFailures.length > 0) {
@@ -428,10 +572,36 @@ function loadProfile(name) {
                     process.exit(1);
                 }
             }
+        } else if (entry.name === 'gem_auth') {
+            // Restore Google OAuth tokens and auth files to ~/.gemini/ root
+            const gemAuthSrc = path.join(profilePath, 'gem_auth');
+            for (const authEntry of fs.readdirSync(gemAuthSrc, { withFileTypes: true })) {
+                const srcPath  = path.join(gemAuthSrc, authEntry.name);
+                const destPath = path.join(geminiRootPath, authEntry.name);
+                try {
+                    if (authEntry.isDirectory()) copyDirRecursive(srcPath, destPath);
+                    else fs.copyFileSync(srcPath, destPath);
+                } catch (e) {
+                    console.error(`Failed to restore auth file: ${srcPath} -> ${destPath}: ${e.message}`);
+                }
+            }
+            console.log(`[DEBUG] Google auth tokens restored for profile '${name}'.`);
+        } else if (entry.name === 'gem_history') {
+            // Restore chat history to ~/.gemini/history/
+            const historySrc = path.join(profilePath, 'gem_history');
+            fs.mkdirSync(geminiHistoryPath, { recursive: true });
+            try {
+                copyDirRecursive(historySrc, geminiHistoryPath);
+                console.log(`[DEBUG] Chat history restored for profile '${name}'.`);
+            } catch (e) {
+                console.error(`Failed to restore chat history: ${e.message}`);
+            }
         } else if (entry.name === 'gem_data') {
-            // Restore .gemini folder
-            fs.mkdirSync(antigravityGemPath, { recursive: true });
-            copyDirRecursive(path.join(profilePath, 'gem_data'), antigravityGemPath);
+            // Legacy: restore old .gemini/antigravity-browser-profile format (if any)
+            // This handles profiles saved before the path fix.
+            const legacyGemPath = path.join(os.homedir(), '.gemini', 'antigravity-browser-profile');
+            fs.mkdirSync(legacyGemPath, { recursive: true });
+            copyDirRecursive(path.join(profilePath, 'gem_data'), legacyGemPath);
         } else if (entry.name.startsWith('config_')) {
             // Restore .config/Antigravity folder
             const realName = entry.name.slice('config_'.length);
