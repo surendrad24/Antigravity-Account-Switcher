@@ -41,6 +41,8 @@ function activate(context) {
         .getConfiguration('antigravitySwitcher')
         .get('autoSnapshotMinutes', 0)) || 0;
 
+    let isSwitching = false;
+
     // ============================================
     // CROSS-PLATFORM PATHS
     // ============================================
@@ -398,6 +400,7 @@ function activate(context) {
     }
 
     async function handleRateLimitDetected() {
+        if (isSwitching) return;
         const now = Date.now();
         if (now - lastRateLimitAlert < RATE_LIMIT_COOLDOWN) return;
         lastRateLimitAlert = now;
@@ -417,14 +420,34 @@ function activate(context) {
         );
 
         if (selected && selected !== 'Dismiss') {
+            isSwitching = true;
             appendActivityLog(`Rate limit detected; user selected profile "${selected}"`);
-            vscode.window.withProgress({
+            await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
                 title: `Switching to "${selected}"...`,
                 cancellable: false,
             }, async () => {
-                await runProfileManager('Load', selected);
+                savePendingWorkspace();
+                const previousProfile = getActiveProfile();
+                if (previousProfile) {
+                    await runProfileManager('Save', previousProfile);
+                    await runProfileManager('Save', '__last_known_good');
+                }
+                setActiveProfile(selected);
+                const result = await runProfileManager('Load', selected);
+                if (!result.success) {
+                    appendActivityLog(`Switch FAILED to "${selected}": ${result.error}`);
+                    if (previousProfile) {
+                        await runProfileManager('Load', '__last_known_good');
+                        setActiveProfile(previousProfile);
+                    }
+                    vscode.window.showErrorMessage(`Failed to switch: ${result.error}`);
+                } else {
+                    appendActivityLog(`Switched to "${selected}"`);
+                    recordAnalytics('switch_success', selected);
+                }
             });
+            isSwitching = false;
         }
     }
 
@@ -584,7 +607,10 @@ function activate(context) {
                         return;
                     }
 
-                    vscode.window.withProgress({
+                    if (isSwitching) return;
+                    isSwitching = true;
+
+                    await vscode.window.withProgress({
                         location: vscode.ProgressLocation.Notification,
                         title: `Switching to "${profileName}"...`,
                         cancellable: false,
@@ -592,6 +618,7 @@ function activate(context) {
                         savePendingWorkspace();
                         const previousProfile = getActiveProfile();
                         if (previousProfile) {
+                            await runProfileManager('Save', previousProfile);
                             await runProfileManager('Save', '__last_known_good');
                         }
                         setActiveProfile(profileName);
@@ -609,6 +636,7 @@ function activate(context) {
                         }
                         // Antigravity will restart automatically
                     });
+                    isSwitching = false;
                 } else {
                     vscode.window.showInformationMessage(
                         `Slot ${slotNum + 1} is empty. Click the + button to save your current session.`
@@ -673,6 +701,9 @@ function activate(context) {
             const result = await runProfileManager(action, profileName);
             
             if (result.success) {
+                if (action === 'Save') {
+                    setActiveProfile(profileName);
+                }
                 appendActivityLog(`Created profile "${profileName}" via action "${action}"`);
                 recordAnalytics('profile_create', profileName);
                 vscode.window.showInformationMessage(`Profile "${profileName}" created successfully!`);
@@ -754,7 +785,10 @@ function activate(context) {
         if (!selected) return;
         if (!await verifyPinIfEnabled()) return;
 
-        vscode.window.withProgress({
+        if (isSwitching) return;
+        isSwitching = true;
+
+        await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: `Switching to "${selected.profileName}"...`,
             cancellable: false,
@@ -762,6 +796,7 @@ function activate(context) {
             savePendingWorkspace();
             const previousProfile = getActiveProfile();
             if (previousProfile) {
+                await runProfileManager('Save', previousProfile);
                 await runProfileManager('Save', '__last_known_good');
             }
             setActiveProfile(selected.profileName);
@@ -778,6 +813,7 @@ function activate(context) {
                 recordAnalytics('switch_success', selected.profileName);
             }
         });
+        isSwitching = false;
     });
     context.subscriptions.push(switchCmd);
 
@@ -1091,7 +1127,8 @@ function activate(context) {
         const fallback = profiles
             .filter(p => Number(p.Size || 0) > 1 && (p.Name || p.name) !== active)
             .sort((a, b) => Number(b.Size || 0) - Number(a.Size || 0))[0];
-        if (active && activeSize <= 1 && fallback) {
+        const rootHasData = fs.existsSync(path.join(ANTIGRAVITY_DATA, 'Cookies')) || fs.existsSync(path.join(ANTIGRAVITY_DATA, 'Network', 'Cookies')) || fs.existsSync(path.join(ANTIGRAVITY_DATA, 'Preferences'));
+        if (active && !rootHasData && fallback) {
             const pick = await vscode.window.showWarningMessage(
                 `Active profile "${active}" looks empty. Restore "${fallback.Name || fallback.name}"?`,
                 'Restore',
